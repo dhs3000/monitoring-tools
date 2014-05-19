@@ -16,17 +16,18 @@ def flattenDicts(dicts):
 
 class Request:
 	"Request of JMX values for given MBean and attribute. Might result in multiple values (key, value pairs)."
-	def __init__(self, type, mbean, attribute):
+	def __init__(self, type, mbean, attribute = None):
 		self._type = type
 		self._mbean = mbean
 		self._attribute = attribute
 
 	def asJsonString(self):
-		data = {
-			"type" : self._type,
-			"mbean" : self._mbean,
-			"attribute" : self._attribute
-		}
+		data = {}
+		data["type"] = self._type
+		data["mbean"] = self._mbean
+		if self._attribute is not None:
+			data["attribute"] = self._attribute
+
 		return json.dumps(data)
 
 class Response:
@@ -36,13 +37,17 @@ class Response:
 		
 		self._type = request['type']
 		self._mbean = request['mbean']
-		self._attribute = request['attribute']
+		self._attribute = request['attribute'] if 'attribute' in request else None
 
 		self._value = data['value'] 
 
 	def _sortedDesc(self, description):
 		"Sort the description so that basic information (like type or host) comes first and it makes a usefull hierachical key in Graphite."
-		result = []
+		
+		if '*' in description:
+			return description
+
+		result = []			
 		descriptions = dict(kv.split("=") for kv in description.split(","))
 		
 		if 'type' in descriptions:
@@ -54,7 +59,15 @@ class Response:
 			value = descriptions.pop('host')
 			if value is not None:
 				result.append('host=%s' % value)
-		
+
+		if 'context' in descriptions:
+			value = descriptions.pop('context')
+			if value is not None:
+				if value == '/':
+					value = 'ROOT'
+				value = re.sub('[/]', '', value)	
+				result.append('context=%s' % value)
+
 		for k, v in descriptions.items():
 			result.append('%s=%s' % (k, v))
 
@@ -68,17 +81,26 @@ class Response:
 		mbean = "%s.%s" % (base, desc)	
 		return re.sub('[=:,]', '.', mbean)
 
+	def _baseKey(self):
+		name = self._name()
+		if self._attribute is None:
+			return "%s" % name
+		return "%s.%s" % (name, self._attribute)
+
 	def data(self):
 		result = {}
-		baseKey = "%s.%s" % (self._name(), self._attribute)
+		baseKey = self._baseKey()
 
 		if isinstance(self._value, dict):
-			for k, v in self._value.iteritems():
+			for k, v in self._value.items():
 				result['%s.%s' % (baseKey, k)] = v
 		else:
 			result[baseKey] = self._value
 
 		return result
+
+	def value(self):
+		return self._value	
 
 class Result:
 	"Wrapper for results of a Jolokia request."
@@ -86,7 +108,10 @@ class Result:
 		self._responses = responses
 
 	def asDict(self):
-		return flattenDicts([response.data() for response in self._responses])	
+		return flattenDicts([response.data() for response in self._responses])
+
+	def single(self):
+		return self._responses[0]
 
 
 class Jolokia:
@@ -98,7 +123,11 @@ class Jolokia:
 	def read(self, **kwargs):
 		self._requests.append(Request('read', kwargs['mbean'], kwargs['attribute']))
 		return self
-	
+
+	def search(self, **kwargs):
+		self._requests.append(Request('search', kwargs['mbean']))
+		return self
+
 	def _requestData(self):
 		return "[%s]" % (', '.join([request.asJsonString() for request in self._requests]))
 
@@ -120,20 +149,28 @@ def printForDiamondUserScript(result):
 	for k, v in result.asDict().items():
 		print "%s %s" % (k, v)	
 
+def localJolokiaUrl(port):
+	return "http://localhost:%d/jolokia/" % port
+
+class JolokiaSearch:
+	def __init__(self, **kwargs):
+		self.port = kwargs['port']
+
+	def search(self, search):
+		return Jolokia(localJolokiaUrl(self.port)).search(mbean = search).execute().single().value()
+			
+
 class JolokiaToDiamond:
 	"Retrieves the requested JMX data through a locally running Jolokia server and prints it out in Diamond UserScript syntax."
-	def __init__(self):
-		pass
+	def __init__(self, **kwargs):
+		self.port = kwargs['port']
 
 	def _print(self, result):
 		for k, v in result.asDict().items():
-			print "%s %s" % (k, v)	
+			print "jmx.%s %s" % (k, v)
 
-	def port(self, port):
-		self.port = port
-		return self
 	def get(self, *values):
-		jolokia = Jolokia("http://localhost:%d/jolokia/" % self.port)
+		jolokia = Jolokia(localJolokiaUrl(self.port))
 
 		for v in values:
 			jolokia.read(**v)
@@ -148,15 +185,38 @@ if __name__ == "__main__":
 	#	.read(mbean = "Catalina:type=Manager,context=/jsf-playground,host=localhost", attribute = "activeSessions")\
 	#	.executeAndForwardTo(printForDiamondUserScript)
 
-	JolokiaToDiamond().port(7777).get(*(
+	data = [
+		### JVM
+		# Memory
 		{
 			'mbean': 'java.lang:type=Memory',
 			'attribute': 'HeapMemoryUsage'
 		},
 		{
-			'mbean': 'Catalina:type=Manager,context=/jsf-playground,host=localhost',
-			'attribute': 'activeSessions'
-		}
-	))	
+			'mbean': 'java.lang:type=Memory',
+			'attribute': 'NonHeapMemoryUsage'
+		},
+		# Threads
+		{
+			'mbean': 'java.lang:type=Threading',
+			'attribute': 'ThreadCount'
+		},
+		# GarbageCollection?
+
+		# ClassLoading
+		{
+			'mbean': 'java.lang:type=ClassLoading',
+			'attribute': 'LoadedClassCount'
+		},
+		{
+			'mbean': 'java.lang:type=ClassLoading',
+			'attribute': 'UnloadedClassCount'
+		},
+
+		### Tomcat
+		# active Session per Discovery below
+	] + [{'mbean': manager, 'attribute': 'activeSessions'} for manager in JolokiaSearch(port = 7777).search('Catalina:type=Manager,*') ]
+
+	JolokiaToDiamond(port = 7777).get(*data)	
 	
 
