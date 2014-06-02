@@ -1,4 +1,5 @@
 #!/usr/bin/python
+#coding: utf8
 """
 Retrieves JMX data through locally running Jolokia server in a batch and prints them out in Diamond user script format.
 
@@ -10,9 +11,18 @@ import urllib2
 import re
 import itertools
 
-def flattenDicts(dicts):
-    return {k: v for d in dicts for k, v in d.items()}	
-		
+class Collections:
+	@classmethod
+	def flattenDicts(cls, dicts):
+	    return {k: v for d in dicts for k, v in d.items()}
+
+	@classmethod
+	def isListOrTuple(cls, l):
+		return isinstance(l, (list, tuple))
+
+	@classmethod
+	def flattenLists(cls, lists):
+		return [ll for ll in l for l in lists if cls.isListOrTuple(l)] + [l for l in lists if not cls.isListOrTuple(l)]
 
 class Request:
 	"Request of JMX values for given MBean and attribute. Might result in multiple values (key, value pairs)."
@@ -37,9 +47,35 @@ class Response:
 		
 		self._type = request['type']
 		self._mbean = request['mbean']
-		self._attribute = request['attribute'] if 'attribute' in request else None
+		self._attribute = request.get('attribute', None)
 
 		self._value = data['value'] 
+
+	@classmethod
+	def of(cls, data):
+		"Creates Response objects for the given data. Might result in multiple Response objects if the request included wildcards."
+		request = data['request']
+		type = request['type']
+
+		if (type == 'read' and '*' in data['request']['mbean']):
+
+			result = []
+
+			for k, v in data['value'].items():
+				mbean = k
+				for attribute, value in v.items():
+					subData = {
+						'request': {
+							'type': type,
+							'mbean': mbean,
+							'attribute': attribute
+						},
+						'value': value
+					}
+					result.append(cls(subData))
+			return result
+		
+		return cls(data)
 
 	def _sortedDesc(self, description):
 		"Sort the description so that basic information (like type or host) comes first and it makes a usefull hierachical key in Graphite."
@@ -108,7 +144,7 @@ class Result:
 		self._responses = responses
 
 	def asDict(self):
-		return flattenDicts([response.data() for response in self._responses])
+		return Collections.flattenDicts([response.data() for response in self._responses])
 
 	def single(self):
 		return self._responses[0]
@@ -121,7 +157,7 @@ class Jolokia:
 		self._url = url
 
 	def read(self, **kwargs):
-		self._requests.append(Request('read', kwargs['mbean'], kwargs['attribute']))
+		self._requests.append(Request('read', kwargs['mbean'], kwargs.get('attribute', None)))
 		return self
 
 	def search(self, **kwargs):
@@ -139,15 +175,10 @@ class Jolokia:
 			req.close()
 
 	def execute(self):
-		return Result([Response(r) for r in json.loads(self._readJson())])
+		return Result(Collections.flattenLists([Response.of(r) for r in json.loads(self._readJson())]))
 
 	def executeAndForwardTo(self, resultHandler):
 		resultHandler(self.execute())
-
-
-def printForDiamondUserScript(result):
-	for k, v in result.asDict().items():
-		print "%s %s" % (k, v)	
 
 def localJolokiaUrl(port):
 	return "http://localhost:%d/jolokia/" % port
@@ -166,7 +197,7 @@ class JolokiaToDiamond:
 		self.port = kwargs['port']
 
 	def _print(self, result):
-		for k, v in result.asDict().items():
+		for k, v in sorted(result.asDict().items()):
 			print "jmx.%s %s" % (k, v)
 
 	def get(self, *values):
@@ -177,14 +208,22 @@ class JolokiaToDiamond:
 
 		jolokia.executeAndForwardTo(self._print)
 
+###################
+### Configure below
 
 if __name__ == "__main__":
 
+	# Direct usage:
 	#Jolokia("http://localhost:7777/jolokia/")\
 	#	.read(mbean = "java.lang:type=Memory", attribute = "HeapMemoryUsage")\
 	#	.read(mbean = "Catalina:type=Manager,context=/jsf-playground,host=localhost", attribute = "activeSessions")\
 	#	.executeAndForwardTo(printForDiamondUserScript)
 
+	# Discovery of possible requests:
+	# [{'mbean': manager, 'attribute': 'activeSessions'} for manager in JolokiaSearch(port = 7777).search('Catalina:type=Manager,*') ]
+
+	# Example configuration
+	# attribute could be left out to retrieve all attributes of an mbean
 	data = [
 		### JVM
 		# Memory
@@ -201,21 +240,16 @@ if __name__ == "__main__":
 			'mbean': 'java.lang:type=Threading',
 			'attribute': 'ThreadCount'
 		},
-		# GarbageCollection?
 
-		# ClassLoading
-		{
-			'mbean': 'java.lang:type=ClassLoading',
-			'attribute': 'LoadedClassCount'
-		},
-		{
-			'mbean': 'java.lang:type=ClassLoading',
-			'attribute': 'UnloadedClassCount'
-		},
 
 		### Tomcat
-		# active Session per Discovery below
-	] + [{'mbean': manager, 'attribute': 'activeSessions'} for manager in JolokiaSearch(port = 7777).search('Catalina:type=Manager,*') ]
+		# Example for usage of wildcards in mbean
+		{
+			"type" : "read",
+			"mbean" : "*:context=*,host=localhost,type=Manager",
+			"attribute" : "activeSessions"
+		}
+	]
 
 	JolokiaToDiamond(port = 7777).get(*data)	
 	
