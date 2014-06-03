@@ -14,7 +14,7 @@ import itertools
 class Collections:
 	@classmethod
 	def flattenDicts(cls, dicts):
-	    return {k: v for d in dicts for k, v in d.items()}
+		return {k: v for d in dicts for k, v in d.items()}
 
 	@classmethod
 	def isListOrTuple(cls, l):
